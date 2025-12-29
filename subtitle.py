@@ -1,286 +1,249 @@
 """
-影片字幕自動生成工具
+影片字幕自動生成工具 (無 Argparse 版)
 
 使用 whisper.cpp 為影片自動生成繁體中文字幕
-- 輸入目錄：video/
-- 輸出目錄：subtitle/
-- 支援格式：.mp4, .mov, .m4a, .mp3, .mkv, .wav
+- 直接在程式碼開頭修改設定
+- 自動轉碼音訊為 16kHz/16-bit
+- 跨平台支援 (Windows/macOS/Linux)
 """
 
 import subprocess
 import os
 import sys
 import shutil
+import platform
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional
 
-# 嘗試導入 tqdm，如果沒有則使用降級方案
+# ==========================================
+# 👇 【使用者設定區域】請在此修改設定
+# ==========================================
+
+# 輸入影片的資料夾
+INPUT_DIR = 'video'
+
+# 輸出字幕的資料夾
+OUTPUT_DIR = 'subtitle'
+
+# 模型檔案路徑 (例如: ggml-large-v3.bin)
+MODEL_PATH = 'ggml-large-v3.bin'
+
+# whisper.cpp 的執行檔名稱 (Windows 通常是 main.exe，Mac/Linux 是 main)
+# 如果執行檔不在同目錄，請填寫完整路徑
+WHISPER_EXEC_NAME = 'main'
+
+# 支援的影片格式
+SUPPORTED_EXTENSIONS = {'.mp4', '.mov', '.m4a', '.mp3', '.mkv', '.wav', '.webm', '.flv'}
+
+# ==========================================
+# 👆 設定結束
+# ==========================================
+
+# 嘗試導入 tqdm
 try:
     from tqdm import tqdm
     TQDM_AVAILABLE = True
 except ImportError:
     TQDM_AVAILABLE = False
-    print("💡 提示: 安裝 tqdm 可獲得進度條顯示 (pip install tqdm)\n")
 
-# 設定
-VIDEO_DIR = 'video'
-SUBTITLE_DIR = 'subtitle'
-MODEL_FILE = 'ggml-large-v3.bin'
-SUPPORTED_EXTENSIONS = {'.mp4', '.mov', '.m4a', '.mp3', '.mkv', '.wav'}
+# 全域變數用來儲存確認過的執行檔路徑
+VALID_WHISPER_PATH = ""
 
+def check_dependencies() -> Optional[str]:
+    """
+    檢查必要的依賴是否存在
+    Returns: None if success, error message string if failed
+    """
+    global VALID_WHISPER_PATH
 
-def check_dependencies():
-    """檢查必要的依賴是否存在"""
-    errors = []
-    
-    # 檢查 ffmpeg
+    # 1. 檢查 ffmpeg
     if not shutil.which('ffmpeg'):
-        errors.append("❌ 找不到 ffmpeg，請先安裝 ffmpeg")
+        return "❌ 找不到 ffmpeg，請確保已安裝並加入系統環境變數 PATH 中。"
     
-    # 檢查 whisper.cpp 的 main 執行檔
-    if not shutil.which('main'):
-        errors.append(f"❌ 找不到 whisper.cpp 的 main 執行檔")
+    # 2. 檢查 whisper.cpp 執行檔
+    target_exec = WHISPER_EXEC_NAME
     
-    # 檢查模型檔案
-    if not os.path.isfile(MODEL_FILE):
-        errors.append(f"❌ 找不到模型檔案: {MODEL_FILE}")
-    
-    # 檢查 video 目錄
-    if not os.path.isdir(VIDEO_DIR):
-        errors.append(f"❌ 找不到輸入目錄: {VIDEO_DIR}/")
-    
-    if errors:
-        print("\n".join(errors))
-        return False
-    
-    return True
+    # Windows 自動補全 .exe (如果使用者沒寫)
+    if platform.system() == "Windows" and not target_exec.lower().endswith('.exe'):
+        candidates = [f"{target_exec}.exe", target_exec]
+    else:
+        candidates = [target_exec]
 
+    found_exec = None
+    # 先找系統路徑，再找當前路徑
+    for cand in candidates:
+        if shutil.which(cand):
+            found_exec = shutil.which(cand)
+            break
+        if Path(cand).resolve().is_file():
+            found_exec = str(Path(cand).resolve())
+            break
+            
+    if not found_exec:
+        return f"❌ 找不到 whisper.cpp 執行檔: {WHISPER_EXEC_NAME}"
+    
+    VALID_WHISPER_PATH = found_exec
 
-def extract_audio_with_filters(input_file: str, output_file: str) -> bool:
-    """
-    使用 ffmpeg 提取並優化音頻
-    - 單聲道 (mono)
-    - 16kHz 採樣率
-    - PCM 16-bit 編碼
-    - 音頻濾鏡：loudnorm + highpass + lowpass（提高識別準確度）
+    # 3. 檢查模型檔案
+    if not Path(MODEL_PATH).is_file():
+        return f"❌ 找不到模型檔案: {MODEL_PATH}"
     
-    Args:
-        input_file: 輸入影片/音頻檔案路徑
-        output_file: 輸出 WAV 檔案路徑
-    
-    Returns:
-        True 如果成功，False 如果失敗
-    """
+    return None
+
+def extract_audio(input_file: Path, output_wav: Path) -> bool:
+    """使用 ffmpeg 提取並優化音頻"""
     cmd = [
-        'ffmpeg', '-y', '-i', input_file,
-        '-ar', '16000',
-        '-ac', '1',
-        '-c:a', 'pcm_s16le',
-        '-af', 'loudnorm,highpass=f=80,lowpass=f=8000',
-        output_file
+        'ffmpeg', '-y', 
+        '-v', 'error',         # 減少輸出訊息
+        '-i', str(input_file),
+        '-ar', '16000',        # 採樣率
+        '-ac', '1',            # 單聲道
+        '-c:a', 'pcm_s16le',   # 16-bit
+        '-af', 'loudnorm,highpass=f=80,lowpass=f=8000', # 濾鏡
+        str(output_wav)
     ]
     
     try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True
-        )
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         return True
     except subprocess.CalledProcessError as e:
-        print(f"  ❌ 音頻提取失敗: {e}")
+        print(f"  ❌ FFmpeg 錯誤: {e.stderr.decode('utf-8', errors='ignore')}")
         return False
 
-
-def generate_subtitle(wav_file: str, output_srt: str) -> bool:
-    """
-    使用 whisper.cpp 生成字幕
-    
-    Args:
-        wav_file: 輸入 WAV 檔案路徑
-        output_srt: 輸出 SRT 字幕檔案路徑
-    
-    Returns:
-        True 如果成功，False 如果失敗
-    """
-    # whisper.cpp 會自動在 wav 檔名後加 .srt
-    temp_srt = f"{wav_file}.srt"
-    
-    cmd = (
-        f'chcp 65001 && main -m {MODEL_FILE} '
-        f'--prompt "使用繁體中文" -f "{wav_file}" -l zh -osrt'
-    )
+def run_whisper(wav_file: Path) -> bool:
+    """執行 whisper.cpp 生成字幕"""
+    cmd = [
+        VALID_WHISPER_PATH,
+        '-m', MODEL_PATH,
+        '-f', str(wav_file),
+        '-l', 'zh',            
+        '--prompt', '使用繁體中文', 
+        '-osrt'                
+    ]
     
     try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True
-        )
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         
-        # 移動字幕檔案到目標位置
-        if os.path.isfile(temp_srt):
-            shutil.move(temp_srt, output_srt)
+        # 檢查是否生成了預期的 .srt 檔案 (whisper.cpp 預設行為: input.wav -> input.wav.srt)
+        expected_srt = wav_file.with_suffix(wav_file.suffix + '.srt')
+        if expected_srt.exists():
             return True
-        else:
-            print(f"  ❌ 未生成字幕檔案: {temp_srt}")
-            return False
-            
+        return False
+        
     except subprocess.CalledProcessError as e:
-        print(f"  ❌ 字幕生成失敗: {e}")
+        print(f"  ❌ Whisper 錯誤: {e.stderr.decode('utf-8', errors='ignore')}")
         return False
 
-
-def process_video(video_path: str, subtitle_dir: str, show_status: bool = True) -> bool:
-    """
-    處理單個影片檔案，生成字幕
-    
-    Args:
-        video_path: 影片檔案完整路徑
-        subtitle_dir: 字幕輸出目錄
-        show_status: 是否顯示處理狀態訊息
-    
-    Returns:
-        True 如果成功，False 如果失敗或跳過
-    """
-    video_path_obj = Path(video_path)
-    file_name = video_path_obj.name
-    file_stem = video_path_obj.stem
-    file_ext = video_path_obj.suffix.lower()
-    
-    # 檢查副檔名
-    if file_ext not in SUPPORTED_EXTENSIONS:
-        return False
-    
-    # 計算相對路徑以保持目錄結構
-    rel_path = video_path_obj.relative_to(VIDEO_DIR)
-    output_srt_path = Path(subtitle_dir) / rel_path.parent / f"{file_stem}.srt"
-    
-    # 如果字幕已存在，跳過
-    if output_srt_path.exists():
-        return False
-    
-    # 建立輸出目錄
-    output_srt_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # 臨時 WAV 檔案路徑
-    temp_wav = video_path_obj.parent / f"{file_stem}_temp.wav"
-    keep_wav = (file_ext == '.wav')
-    
+def process_single_file(video_path: Path, input_root: Path, output_root: Path) -> bool:
+    """處理單個檔案的完整流程"""
+    # 計算相對路徑
     try:
-        # 步驟 1: 提取音頻（如果不是已存在的 WAV）
-        if not keep_wav or not video_path_obj.exists():
-            if show_status:
-                if TQDM_AVAILABLE:
-                    tqdm.write("  ⏳ 提取音頻...")
-                else:
-                    print("  ⏳ 提取音頻...")
-            if not extract_audio_with_filters(str(video_path), str(temp_wav)):
-                return False
-        else:
-            temp_wav = video_path_obj
+        rel_path = video_path.relative_to(input_root)
+    except ValueError:
+        rel_path = video_path.name
         
-        # 步驟 2: 生成字幕
-        if show_status:
-            if TQDM_AVAILABLE:
-                tqdm.write("  🤖 生成字幕...")
-            else:
-                print("  🤖 生成字幕...")
-        success = generate_subtitle(str(temp_wav), str(output_srt_path))
-        
-        # 清理臨時 WAV 檔案
-        if not keep_wav and temp_wav.exists():
-            temp_wav.unlink()
-        
-        return success
-        
-    except Exception as e:
-        print(f"  ❌ 處理失敗: {e}")
-        # 清理臨時檔案
-        if not keep_wav and temp_wav.exists():
-            temp_wav.unlink()
-        return False
-
-
-def collect_video_files(video_dir: str) -> List[str]:
-    """收集所有需要處理的影片檔案"""
-    video_files = []
-    for root, dirs, files in os.walk(video_dir):
-        for file in files:
-            file_path = os.path.join(root, file)
-            ext = Path(file_path).suffix.lower()
-            if ext in SUPPORTED_EXTENSIONS:
-                # 檢查是否已有字幕
-                rel_path = Path(file_path).relative_to(video_dir)
-                srt_path = Path(SUBTITLE_DIR) / rel_path.parent / f"{Path(file_path).stem}.srt"
-                if not srt_path.exists():
-                    video_files.append(file_path)
+    target_srt_path = output_root / rel_path.parent / f"{video_path.stem}.srt"
     
-    return video_files
+    # 檢查是否已存在
+    if target_srt_path.exists():
+        return False 
+        
+    # 建立輸出目錄
+    target_srt_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # 臨時 WAV 路徑 (放在輸出目錄，處理完刪除)
+    temp_wav = target_srt_path.parent / f"{video_path.stem}_temp.wav"
+    temp_srt_generated = temp_wav.with_suffix('.wav.srt') 
+    
+    result = False
+    try:
+        # 1. 提取音頻
+        if extract_audio(video_path, temp_wav):
+            # 2. 生成字幕
+            if run_whisper(temp_wav):
+                # 3. 移動並重新命名
+                if temp_srt_generated.exists():
+                    shutil.move(str(temp_srt_generated), str(target_srt_path))
+                    result = True
+                else:
+                    print(f"  ❌ 未找到生成的字幕檔")
+    except Exception as e:
+        print(f"  ❌ 處理異常: {e}")
+    finally:
+        # 清理臨時檔案
+        for temp in [temp_wav, temp_srt_generated]:
+            if temp.exists():
+                try: os.remove(temp)
+                except: pass
 
+    return result
 
 def main():
-    """主程式"""
     print("=" * 60)
-    print("影片字幕自動生成工具 (whisper.cpp + 音頻濾鏡優化)")
-    print("=" * 60)
-    
-    # 檢查依賴
-    if not check_dependencies():
-        sys.exit(1)
-    
-    # 建立字幕輸出目錄
-    os.makedirs(SUBTITLE_DIR, exist_ok=True)
-    
-    # 收集所有影片檔案
-    print(f"\n📁 掃描 {VIDEO_DIR}/ 目錄...")
-    video_files = collect_video_files(VIDEO_DIR)
-    
-    if not video_files:
-        print(f"✅ 沒有需要處理的影片檔案（可能都已生成字幕）")
-        return
-    
-    print(f"📊 找到 {len(video_files)} 個需要處理的影片檔案\n")
-    
-    # 處理影片
-    success_count = 0
-    failed_count = 0
-    
-    if TQDM_AVAILABLE:
-        # 使用 tqdm 顯示進度條
-        for video_file in tqdm(video_files, desc="生成字幕", unit="個", ncols=80):
-            rel_name = Path(video_file).relative_to(VIDEO_DIR)
-            tqdm.write(f"\n🎬 {rel_name}")
-            if process_video(video_file, SUBTITLE_DIR, show_status=True):
-                success_count += 1
-                tqdm.write(f"✅ 完成\n")
-            else:
-                failed_count += 1
-                tqdm.write(f"⏭️  跳過\n")
-    else:
-        # 降級方案：顯示詳細進度
-        total = len(video_files)
-        for i, video_file in enumerate(video_files, 1):
-            rel_name = Path(video_file).relative_to(VIDEO_DIR)
-            print(f"\n[{i}/{total}] 🎬 {rel_name}")
-            if process_video(video_file, SUBTITLE_DIR, show_status=False):
-                success_count += 1
-                print(f"✅ 完成 ({i}/{total})")
-            else:
-                failed_count += 1
-                print(f"⏭️  跳過")
-    
-    # 顯示統計結果
-    print("\n" + "=" * 60)
-    print(f"✅ 成功: {success_count} 個")
-    if failed_count > 0:
-        print(f"❌ 失敗: {failed_count} 個")
-    print(f"📂 字幕已儲存至: {SUBTITLE_DIR}/")
+    print("🎬 影片字幕自動生成工具 (Whisper.cpp)")
     print("=" * 60)
 
+    # 檢查依賴
+    error_msg = check_dependencies()
+    if error_msg:
+        print(f"\n{error_msg}")
+        if not TQDM_AVAILABLE:
+            print("💡 提示: pip install tqdm 可獲得進度條顯示")
+        sys.exit(1)
+
+    input_root = Path(INPUT_DIR)
+    output_root = Path(OUTPUT_DIR)
+
+    if not input_root.exists():
+        print(f"❌ 錯誤: 輸入目錄不存在 '{input_root}'")
+        sys.exit(1)
+
+    # 掃描檔案
+    print("\n🔍 正在掃描影片檔案...")
+    tasks = []
+    for root, _, files in os.walk(input_root):
+        for file in files:
+            file_path = Path(root) / file
+            if file_path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                # 檢查是否已存在字幕
+                rel_p = file_path.relative_to(input_root)
+                dest_srt = output_root / rel_p.parent / f"{file_path.stem}.srt"
+                if not dest_srt.exists():
+                    tasks.append(file_path)
+
+    total_tasks = len(tasks)
+    if total_tasks == 0:
+        print("✅ 沒有需要處理的影片 (可能都已生成字幕)。")
+        return
+
+    print(f"📊 待處理影片數: {total_tasks}\n")
+
+    success_count = 0
+    fail_count = 0
+
+    # 進度條處理
+    iterator = tqdm(tasks, unit="片", ncols=80) if TQDM_AVAILABLE else tasks
+    
+    for video_file in iterator:
+        rel_name = video_file.relative_to(input_root)
+        
+        if not TQDM_AVAILABLE:
+            print(f"正在處理: {rel_name} ...", end="", flush=True)
+
+        is_success = process_single_file(video_file, input_root, output_root)
+        
+        if is_success:
+            success_count += 1
+            if not TQDM_AVAILABLE: print(" ✅ 完成")
+        else:
+            fail_count += 1
+            if not TQDM_AVAILABLE: print(" ❌ 失敗")
+
+    print("\n" + "=" * 60)
+    print(f"🏁 處理完成")
+    print(f"✅ 成功: {success_count} | ❌ 失敗: {fail_count}")
+    print(f"📂 字幕位置: {output_root.absolute()}")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()
